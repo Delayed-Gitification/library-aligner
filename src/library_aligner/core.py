@@ -1,4 +1,12 @@
+"""library-aligner: Map RNA sequencing data derived from barcoded DNA libraries.
+
+Extracts barcodes from reads (via flanking sequences or fixed positions),
+matches them to a known library, then aligns each read against the
+barcode-specific reference and writes a sorted, indexed BAM file.
+"""
+
 import os
+import sys
 import tempfile
 import logging
 from dataclasses import dataclass
@@ -63,6 +71,10 @@ class BarcodeMatcher:
         # Build once at init — O(N log N), paid once
         self.tree = pybktree.BKTree(_dist, known_barcodes)
 
+        # Always initialise RC structures to safe defaults
+        self.rc_to_original = {}
+        self.rc_tree = None
+
         if check_reverse_complement:
             self.rc_to_original = {mappy.revcomp(bc): bc for bc in known_barcodes}
             if len(self.rc_to_original) != len(known_barcodes):
@@ -103,6 +115,7 @@ def extract_barcode_sequence(
         read_seq: str, f5_fwd=None, f3_fwd=None, f5_rev=None, f3_rev=None,
         expected_bc_len=15, search_window=350, max_error_rate=0.2,
         start_pos=None, end_pos=None,
+        length_tolerance=2,
 ) -> Optional[str]:
     if start_pos is not None and end_pos is not None:
         return read_seq[start_pos:end_pos] if end_pos <= len(read_seq) else None
@@ -134,9 +147,14 @@ def extract_barcode_sequence(
             res_3 = edlib.align(f3_s, footprint, "HW", "locations", k=f3_errs)
 
             if res_5["editDistance"] != -1 and res_3["editDistance"] != -1:
+                # Intentionally: leftmost 5' match and rightmost 3' match to
+                # maximise the barcode gap between the two flanks.
                 e5, s3 = res_5["locations"][0][1], res_3["locations"][-1][0]
                 if s3 > e5:
                     extracted = footprint[e5 + 1: s3]
+                    # Validate extracted length is within tolerance of expected
+                    if abs(len(extracted) - expected_bc_len) > length_tolerance:
+                        continue
                     return mappy.revcomp(extracted) if orient == "r" else extracted
     return None
 
@@ -147,6 +165,8 @@ def extract_barcode_sequence(
 
 def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, aligners_dict,
                            seq2=None, qual2=None, min_mapq=0):
+    """Map reads and write BAM records. min_mapq filters alignments below this
+    mapping quality threshold (0 = accept all)."""
 
     aligner = aligners_dict.get(barcode)
     if not aligner:
@@ -159,7 +179,11 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
 
     q_arr1 = pysam.qualitystring_to_array(qual1) if qual1 else None
 
+    # Pysam CIGAR ops: M=0, I=1, D=2, N=3, S=4, H=5, P=6, =7, X=8
+    _CIGAR_OPS = "MIDNSHP=X"
+
     def build_cigar(aln, seq_len):
+        # mappy yields (length, op); pysam expects (op, length)
         cigar = [(op, length) for length, op in aln.cigar]
         clip_l, clip_r = aln.q_st, seq_len - aln.q_en
         if aln.strand == 1:
@@ -170,16 +194,37 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
             if clip_l > 0: cigar.append((4, clip_l))
         return cigar
 
-    def set_sequence(a, seq, q_arr, aln):
-        # Sequence and qualities must be set BEFORE cigar
-        if a.is_reverse:
-            a.query_sequence = mappy.revcomp(seq)
+    def cigar_to_string(cigar_tuples):
+        """Convert pysam-style (op, length) tuples to a SAM CIGAR string."""
+        return "".join(f"{length}{_CIGAR_OPS[op]}" for op, length in cigar_tuples)
+
+    def build_sa_tag(alns, seq_len, ref_name):
+        """Build SA:Z tag value for a list of alignments.
+        Format per entry: rname,pos,strand,CIGAR,mapQ,NM;
+        """
+        entries = []
+        for a in alns:
+            strand = "-" if a.strand == -1 else "+"
+            cigar_str = cigar_to_string(build_cigar(a, seq_len))
+            # NM tag: use mappy's NM if available, else 0
+            nm = getattr(a, "NM", 0)
+            entries.append(f"{ref_name},{a.r_st + 1},{strand},{cigar_str},{a.mapq},{nm}")
+        return ";".join(entries) + ";"
+
+    def set_sequence(seg, seq, q_arr):
+        """Set query sequence and qualities on a pysam AlignedSegment.
+        Must be called BEFORE setting cigar."""
+        if seg.is_reverse:
+            seg.query_sequence = mappy.revcomp(seq)
             if q_arr is not None:
-                a.query_qualities = q_arr[::-1]
+                seg.query_qualities = q_arr[::-1]
         else:
-            a.query_sequence = seq
+            seg.query_sequence = seq
             if q_arr is not None:
-                a.query_qualities = q_arr
+                seg.query_qualities = q_arr
+
+    # Resolve reference name for SA tags
+    ref_name = bam_writer.header.references[ref_id]
 
     # --- Paired-end path ---
     if seq2 is not None:
@@ -190,7 +235,16 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
         aln1 = alns1[0]
         aln2 = alns2[0] if alns2 else None
 
-        tlen = (aln2.r_st - aln1.r_st) if aln2 is not None else 0
+        # SAM spec TLEN: rightmost mapped base of downstream mate minus
+        # leftmost mapped base of upstream mate, +1, with sign indicating orientation.
+        if aln2 is not None:
+            leftmost = min(aln1.r_st, aln2.r_st)
+            rightmost = max(aln1.r_en, aln2.r_en)
+            tlen_abs = rightmost - leftmost
+            # Positive for the leftmost mate, negative for the rightmost
+            tlen = tlen_abs if aln1.r_st <= aln2.r_st else -tlen_abs
+        else:
+            tlen = 0
 
         for aln in alns1:
             a = pysam.AlignedSegment(bam_writer.header)
@@ -215,8 +269,12 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
                 a.mate_is_unmapped = True
 
             # Sequence → qualities → cigar
-            set_sequence(a, seq1, q_arr1, aln)
+            set_sequence(a, seq1, q_arr1)
             a.cigar = build_cigar(aln, len(seq1))
+            # SA tag: list other alignments for this read (supplementary support)
+            if len(alns1) > 1:
+                other_alns = [x for x in alns1 if x is not aln]
+                a.set_tag("SA", build_sa_tag(other_alns, len(seq1), ref_name))
             bam_writer.write(a)
 
         for aln in (alns2 if alns2 else []):
@@ -233,10 +291,13 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
             a.next_reference_start = aln1.r_st
             a.mate_is_reverse = (aln1.strand == -1)
             a.is_proper_pair = aln.is_primary
-            a.template_length = -tlen
+            a.template_length = -tlen  # R2 gets the negated R1 TLEN
 
-            set_sequence(a, seq2, q_arr2, aln)
+            set_sequence(a, seq2, q_arr2)
             a.cigar = build_cigar(aln, len(seq2))
+            if len(alns2) > 1:
+                other_alns = [x for x in alns2 if x is not aln]
+                a.set_tag("SA", build_sa_tag(other_alns, len(seq2), ref_name))
             bam_writer.write(a)
 
         # Unmapped R2 placeholder
@@ -268,8 +329,11 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
         a.is_reverse = (aln.strand == -1)
         a.is_supplementary = not aln.is_primary
 
-        set_sequence(a, seq1, q_arr1, aln)
+        set_sequence(a, seq1, q_arr1)
         a.cigar = build_cigar(aln, len(seq1))
+        if len(alns1) > 1:
+            other_alns = [x for x in alns1 if x is not aln]
+            a.set_tag("SA", build_sa_tag(other_alns, len(seq1), ref_name))
         bam_writer.write(a)
 
     return MappingResult.SUCCESS
@@ -278,9 +342,38 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
 # Setup Helpers
 # =============================================================================
 
-def build_aligner_dict(plasmid_references, preset="splice", kmer=None, w_score=None):
-    aligners = {}
+class LazyAlignerDict:
+    """Drop-in replacement for the aligner dict that builds each aligner on
+    demand and discards it after use.  Trades CPU for memory: ~0.8 ms per
+    build for a 10 kb reference, but holds only one aligner at a time."""
+
+    def __init__(self, plasmid_references, preset, kmer=None, w_score=None):
+        self._refs = plasmid_references
+        self._preset = preset
+        self._kmer = kmer
+        self._w = w_score
+
+    def get(self, barcode):
+        ref_data = self._refs.get(barcode)
+        if ref_data is None:
+            return None
+        kwargs = {"seq": ref_data["seq"], "preset": self._preset, "min_chain_score": 25}
+        if self._kmer is not None: kwargs["k"] = self._kmer
+        if self._w is not None: kwargs["w"] = self._w
+        aligner = mappy.Aligner(**kwargs)
+        if not aligner:
+            raise RuntimeError(f"Failed to build on-the-fly aligner for barcode '{barcode}'")
+        return aligner
+
+
+def build_aligner_dict(plasmid_references, preset="splice", kmer=None, w_score=None, cache=True):
     clean_preset = preset.replace("-ax ", "").replace("-x ", "").strip()
+
+    if not cache:
+        logger.info("Aligner caching disabled (--no_mappy_cache). Aligners will be built on the fly.")
+        return LazyAlignerDict(plasmid_references, clean_preset, kmer, w_score)
+
+    aligners = {}
     seq_to_aligner = {}  # keyed on actual sequence — safe regardless of wildcard usage
 
     for barcode, ref_data in plasmid_references.items():
@@ -411,7 +504,9 @@ def run_pipeline(
         check_reverse_complement: bool = True,
         fastq2_path: Optional[str] = None,       # <-- new
         barcode_read: int = 1,
-        fuzzy_mode: str = 'HW',# <-- new
+        barcode_length_tolerance: int = 2,
+        fuzzy_mode: str = 'HW',
+        cache_aligners: bool = True,
 ) -> PipelineStats:
     logger.info("Initialising aligners and barcode matcher...")
 
@@ -422,7 +517,8 @@ def run_pipeline(
         plasmid_library,
         preset=minimap2_preset,
         kmer=minimap2_kmer,
-        w_score=minimap2_w
+        w_score=minimap2_w,
+        cache=cache_aligners,
     )
 
     header, ref_map = create_bam_header(plasmid_library)
@@ -457,6 +553,15 @@ def run_pipeline(
                         logger.warning("R2 exhausted before R1 — FASTQs may be mismatched.")
                         break
                     name2, seq2, qual2 = r2
+                    # Strip /1 /2 or .1 .2 suffixes for comparison
+                    base1 = name1.rsplit("/", 1)[0].rsplit(" ", 1)[0]
+                    base2 = name2.rsplit("/", 1)[0].rsplit(" ", 1)[0]
+                    if base1 != base2:
+                        logger.error(
+                            f"Read name mismatch at read {stats.processed + 1}: "
+                            f"R1='{name1}' vs R2='{name2}'. FASTQs are out of sync."
+                        )
+                        raise RuntimeError("Paired FASTQ files are out of sync — read names do not match.")
                 else:
                     seq2, qual2 = None, None
 
@@ -471,7 +576,8 @@ def run_pipeline(
                     bc_seq, f5_fwd, f3_fwd, f5_rev, f3_rev,
                     expected_bc_len=inferred_bc_len,
                     start_pos=barcode_start_pos,
-                    end_pos=barcode_end_pos
+                    end_pos=barcode_end_pos,
+                    length_tolerance=barcode_length_tolerance,
                 )
                 if not raw_extracted:
                     stats.no_flanks_found += 1
@@ -516,8 +622,6 @@ def run_pipeline(
 # Execution
 # =============================================================================
 
-import sys
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -561,6 +665,8 @@ def main():
                            help="0-based end index of the barcode.")
     loc_group.add_argument("--barcode_read", type=int, choices=[1, 2], default=1,
                            help="Which read the barcode is on when using positional extraction (default: 1).")
+    loc_group.add_argument("--barcode_length_tolerance", type=int, default=2,
+                           help="Max allowed deviation in bp from expected barcode length during flank-based extraction (default: 2).")
 
     # --- Alignment & Matching Settings ---
     align_group = parser.add_argument_group("Alignment & Matching Settings")
@@ -571,11 +677,13 @@ def main():
     align_group.add_argument("--minimap2_preset", default="-ax splice",
                              help="Minimap2 preset (default: '-ax splice').")
     align_group.add_argument("--minimap2_kmer", type=int,
-                             help="Minimap2 k-mer length (-k).")
+                             help="Minimap2 k-mer length (-k).", default=10)
     align_group.add_argument("--minimap2_w", type=int,
-                             help="Minimap2 minimizer window size (-w).")
+                             help="Minimap2 minimizer window size (-w).", default=4)
     align_group.add_argument("--fuzzy_mode", choices=["NW", "HW"], default=None,
                              help="Edit distance mode for fuzzy barcode matching. NW=global (Illumina), HW=infix (ONT). Auto-inferred if not set.")
+    align_group.add_argument("--no_mappy_cache", action="store_true",
+                             help="Build minimap2 aligners on the fly instead of caching all in memory. Slower but uses minimal RAM.")
 
     args = parser.parse_args()
 
@@ -655,7 +763,9 @@ def main():
             check_reverse_complement=check_rc,
             fastq2_path=args.fastq2,  # <-- new
             barcode_read=args.barcode_read,  # <-- new
+            barcode_length_tolerance=args.barcode_length_tolerance,
             fuzzy_mode=fuzzy_mode,
+            cache_aligners=not args.no_mappy_cache,
         )
     except Exception as e:
         logging.error(f"Pipeline failed: {e}")
