@@ -687,8 +687,8 @@ def run_pipeline(
 # Execution
 # =============================================================================
 
-
 def main():
+
     parser = argparse.ArgumentParser(
         description="library-aligner: Map RNA sequencing data derived from barcoded DNA libraries.",
         formatter_class=argparse.RawTextHelpFormatter
@@ -790,8 +790,12 @@ def main():
             parser.error(
                 "Option 2 requires at least one flank (--five_prime_flank and/or --three_prime_flank) OR exact absolute positions (--barcode_start_pos/--barcode_end_pos).")
 
+    if not (args.five_prime_flank or args.three_prime_flank):
+        if not (is_exact_positional):
+            if not args.wildcard:
+                parser.error('You must provide the wildcard, or at least one flank, or the barcode position')
+
     try:
-        # 1. Determine Flanks
         # 1. Determine Flanks
         f5 = args.five_prime_flank
         f3 = args.three_prime_flank
