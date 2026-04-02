@@ -118,23 +118,34 @@ def extract_barcode_sequence(
         start_pos=None, end_pos=None,
         search_first_n_bases=None, search_last_n_bases=None,
         length_tolerance=2,
-        check_reverse_complement: bool = True,  # <-- Added
-) -> Optional[str]:
-    # 1. Exact positional extraction (Illumina Mode - No flanks provided)
-    if not (f5_fwd and f3_fwd):
-        if start_pos is not None and end_pos is not None:
-            return read_seq[start_pos:end_pos] if end_pos <= len(read_seq) else None
-        return None
+        check_reverse_complement: bool = True,
+) -> list[str]:
+    candidates = []
 
-    # 2. Flank-based extraction (Nanopore Mode)
-    fwd_template = f5_fwd + ("N" * expected_bc_len) + f3_fwd
-    max_errs = int(len(fwd_template) * max_error_rate)
+    if not f5_fwd and not f3_fwd:
+        if start_pos is not None and end_pos is not None and end_pos <= len(read_seq):
+            candidates.append(read_seq[start_pos:end_pos])
+        return candidates
+
+    mode = "dual"
+    if f5_fwd and not f3_fwd:
+        mode = "f5_only"
+    elif f3_fwd and not f5_fwd:
+        mode = "f3_only"
+
+    if mode == "dual":
+        fwd_template = f5_fwd + ("N" * expected_bc_len) + f3_fwd
+        max_errs = int((len(f5_fwd) + len(f3_fwd)) * max_error_rate) + length_tolerance
+    elif mode == "f5_only":
+        fwd_template = f5_fwd + ("N" * expected_bc_len)
+        max_errs = int(len(f5_fwd) * max_error_rate)
+    elif mode == "f3_only":
+        fwd_template = ("N" * expected_bc_len) + f3_fwd
+        max_errs = int(len(f3_fwd) * max_error_rate)
+
     dna_eq = [("N", "A"), ("N", "C"), ("N", "G"), ("N", "T")]
 
-    # Always check the forward state
     read_states = [("f", read_seq)]
-
-    # Only check the reverse-complement state if the flag is True
     if check_reverse_complement:
         read_states.append(("r", mappy.revcomp(read_seq)))
 
@@ -149,29 +160,54 @@ def extract_barcode_sequence(
         if not windows_to_check:
             windows_to_check.append(current_seq)
 
-        for window_seq in windows_to_check:
+        for w_idx, window_seq in enumerate(windows_to_check):
+
+            # THE SCAFFOLD SEARCH
             res = edlib.align(fwd_template, window_seq, "HW", "locations", max_errs, additionalEqualities=dna_eq)
-            if res["editDistance"] == -1: continue
+
+            if res["editDistance"] == -1:
+                continue
 
             s, e = res["locations"][0]
             footprint = window_seq[max(0, s - 3): min(len(window_seq), e + 4)]
 
-            f5_errs = int(len(f5_fwd) * max_error_rate)
-            f3_errs = int(len(f3_fwd) * max_error_rate)
+            if mode == "dual":
+                f5_errs = int(len(f5_fwd) * max_error_rate)
+                f3_errs = int(len(f3_fwd) * max_error_rate)
+                res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=f5_errs)
+                res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=f3_errs)
 
-            res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=f5_errs)
-            res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=f3_errs)
+                if res_5["editDistance"] != -1 and res_3["editDistance"] != -1:
+                    e5, s3 = res_5["locations"][0][1], res_3["locations"][-1][0]
+                    if s3 > e5:
+                        extracted = footprint[e5 + 1: s3]
+                        if abs(len(extracted) - expected_bc_len) <= length_tolerance:
+                            candidates.append(extracted)
 
-            if res_5["editDistance"] != -1 and res_3["editDistance"] != -1:
-                e5, s3 = res_5["locations"][0][1], res_3["locations"][-1][0]
-                if s3 > e5:
-                    extracted = footprint[e5 + 1: s3]
-                    if abs(len(extracted) - expected_bc_len) > length_tolerance:
-                        continue
+            elif mode == "f5_only":
+                f5_errs = int(len(f5_fwd) * max_error_rate)
+                res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=f5_errs)
 
-                    return extracted
+                if res_5["editDistance"] != -1:
+                    e5 = res_5["locations"][0][1]
+                    extracted = footprint[e5 + 1: e5 + 1 + expected_bc_len]
 
-    return None
+                    if len(extracted) == expected_bc_len:
+                        candidates.append(extracted)
+
+            elif mode == "f3_only":
+                f3_errs = int(len(f3_fwd) * max_error_rate)
+                res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=f3_errs)
+
+                if res_3["editDistance"] != -1:
+                    s3 = res_3["locations"][-1][0]
+                    extracted = footprint[max(0, s3 - expected_bc_len): s3]
+
+                    if len(extracted) == expected_bc_len:
+                        candidates.append(extracted)
+
+    return candidates
+
 
 # =============================================================================
 # BAM Handling
@@ -469,11 +505,7 @@ def get_flanks(
         bc_placeholder: str,
         five_prime_flank_length: int = 8,
         three_prime_flank_length: int = 8
-) -> tuple[str, str]:
-    """
-    Scans the FASTA file for the wildcard placeholder and dynamically extracts
-    the upstream (5') and downstream (3') flanking sequences.
-    """
+) -> tuple[Optional[str], Optional[str]]:
     lhs_flank_set = set()
     rhs_flank_set = set()
 
@@ -482,10 +514,8 @@ def get_flanks(
         if idx == -1:
             raise ValueError(f"Placeholder '{bc_placeholder}' not found in sequence '{name}'.")
 
-        # Prevent negative indexing if the barcode is very close to the 5' end
         start_5p = max(0, idx - five_prime_flank_length)
 
-        # Extract the flanks
         lhs_flank = seq[start_5p: idx]
         rhs_flank = seq[idx + len(bc_placeholder): idx + len(bc_placeholder) + three_prime_flank_length]
 
@@ -498,8 +528,11 @@ def get_flanks(
             "the exact same sequence context immediately surrounding the wildcard."
         )
 
-    return lhs_flank_set.pop(), rhs_flank_set.pop()
+    lhs = lhs_flank_set.pop()
+    rhs = rhs_flank_set.pop()
 
+    # Return None instead of empty strings if the barcode is at the absolute edge
+    return (lhs if lhs else None), (rhs if rhs else None)
 
 # =============================================================================
 # Main Pipeline
@@ -589,7 +622,8 @@ def run_pipeline(
                 # Route barcode extraction to the correct read
                 bc_seq = seq1 if (barcode_read == 1 or seq2 is None) else seq2
 
-                raw_extracted = extract_barcode_sequence(
+                # Notice this is now explicitly expecting a LIST
+                raw_extracted_list = extract_barcode_sequence(
                     bc_seq, f5_fwd, f3_fwd,
                     expected_bc_len=inferred_bc_len,
                     start_pos=barcode_start_pos,
@@ -597,16 +631,25 @@ def run_pipeline(
                     search_first_n_bases=search_first_n_bases,
                     search_last_n_bases=search_last_n_bases,
                     length_tolerance=barcode_length_tolerance,
-                    check_reverse_complement=check_reverse_complement,  # <-- Added here
+                    check_reverse_complement=check_reverse_complement,
                 )
 
-                if not raw_extracted:
+                if not raw_extracted_list:
                     stats.no_flanks_found += 1
                     continue
 
-                matched_barcode, match_result = matcher.match(
-                    raw_extracted, max_edits=barcode_max_edits
-                )
+                matched_barcode = None
+                match_result = MappingResult.NO_FLANKS_FOUND
+
+                # Test every candidate extracted from the read
+                for raw_extracted in raw_extracted_list:
+                    bc, res = matcher.match(raw_extracted, max_edits=barcode_max_edits)
+                    if bc is not None:
+                        matched_barcode = bc
+                        match_result = res
+                        break  # Stop looking once we find a valid barcode!
+                    else:
+                        match_result = res  # Store the last failure reason for stats
 
                 if matched_barcode is None:
                     if match_result == MappingResult.BARCODE_UNRECOGNISED:
@@ -615,6 +658,7 @@ def run_pipeline(
                         stats.barcode_ambiguous += 1
                     continue
 
+                # --- Proceed with alignment as normal ---
                 correct_rname = plasmid_library[matched_barcode]["rname"]
                 ref_id = ref_map[correct_rname]
                 result = process_and_write_read(
@@ -722,39 +766,36 @@ def main():
         fuzzy_mode = "NW" if args.barcode_start_pos is not None else "HW"
 
     # --- Basic Validation Logic ---
-    is_exact_positional = not args.wildcard and not (args.five_prime_flank and args.three_prime_flank) and (
-                args.barcode_start_pos is not None)
+        # Check if the user has provided AT LEAST one flank
+        has_any_flank = bool(args.five_prime_flank or args.three_prime_flank)
 
-    if args.wildcard and not args.csv:
-        parser.error("Option 1 requires a CSV file (-c/--csv) when providing a wildcard (-wc/--wildcard).")
+        is_exact_positional = not args.wildcard and not has_any_flank and (args.barcode_start_pos is not None)
 
-    if is_exact_positional and check_rc:
-        parser.error(
-            "When using exact positional extraction (no flanks/wildcards), you must set --check_reverse_complement False.")
+        if args.wildcard and not args.csv:
+            parser.error("Option 1 requires a CSV file (-c/--csv) when providing a wildcard (-wc/--wildcard).")
 
-    if args.barcode_read == 2 and not args.fastq2:
-        parser.error("--barcode_read 2 requires a paired FASTQ (--fastq2).")
-
-    # Prevent users from mixing paradigms
-    if is_exact_positional and (args.search_first_n_bases is not None or args.search_last_n_bases is not None):
-        parser.error(
-            "Cannot use search windows (--search_first/last_n_bases) when performing exact positional slicing (--barcode_start_pos without flanks).")
-
-    if args.rname_equals_barcode:
-        if args.wildcard:
-            parser.error("Cannot use --wildcard and --rname_equals_barcode together.")
-        if not (args.five_prime_flank and args.three_prime_flank) and not is_exact_positional:
+        if is_exact_positional and check_rc:
             parser.error(
-                "Option 2 requires explicit flanks (--five_prime_flank/--three_prime_flank) OR exact absolute positions (--barcode_start_pos/--barcode_end_pos).")
+                "When using exact positional extraction (no flanks/wildcards), you must set --check_reverse_complement False.")
+
+        if args.barcode_read == 2 and not args.fastq2:
+            parser.error("--barcode_read 2 requires a paired FASTQ (--fastq2).")
+
+        if args.rname_equals_barcode:
+            if args.wildcard:
+                parser.error("Cannot use --wildcard and --rname_equals_barcode together.")
+            if not has_any_flank and not is_exact_positional:
+                parser.error(
+                    "Option 2 requires at least one flank (--five_prime_flank and/or --three_prime_flank) OR exact absolute positions (--barcode_start_pos/--barcode_end_pos).")
 
     try:
         # 1. Determine Flanks
-        f5, f3 = None, None
-        if args.five_prime_flank and args.three_prime_flank:
-            print("Using explicitly provided flanking sequences...")
-            f5 = args.five_prime_flank
-            f3 = args.three_prime_flank
-        elif args.wildcard:
+        # 1. Determine Flanks
+        f5 = args.five_prime_flank
+        f3 = args.three_prime_flank
+
+        # If the user didn't provide ANY explicit flanks, but did provide a wildcard, auto-detect them
+        if not (f5 or f3) and args.wildcard:
             print(f"Detecting flanks using wildcard '{args.wildcard}'...")
             f5, f3 = get_flanks(
                 fasta_path=args.fasta,
@@ -764,6 +805,8 @@ def main():
             )
             print(f"Detected 5' Flank: {f5}")
             print(f"Detected 3' Flank: {f3}")
+        else:
+            print("Using explicitly provided flanking sequences (Single or Dual)...")
 
         # 2. Build Library Dictionary
         print("Building library dictionary...")
