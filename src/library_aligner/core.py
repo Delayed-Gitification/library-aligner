@@ -52,28 +52,49 @@ class PipelineStats:
 # =============================================================================
 
 class BarcodeMatcher:
-    def __init__(self, known_barcodes: list[str]):
+    def __init__(self, known_barcodes: list[str], check_reverse_complement: bool = True):
         self.known_barcodes = known_barcodes
         self.exact_set = set(known_barcodes)
+        self.check_reverse_complement = check_reverse_complement
 
     def match(self, extracted_seq: str, max_edits: int = 2) -> tuple[Optional[str], MappingResult]:
+        rc_extracted = mappy.revcomp(extracted_seq) if self.check_reverse_complement else None
+
+        # 1. Fast Path: Exact Match
         if extracted_seq in self.exact_set:
             return extracted_seq, MappingResult.SUCCESS
+        if self.check_reverse_complement and rc_extracted in self.exact_set:
+            return rc_extracted, MappingResult.SUCCESS
 
         if max_edits < 1:
             return None, MappingResult.BARCODE_UNRECOGNISED
 
+        # 2. Fuzzy Path: Infix (HW) Search
         best_matches = set()
-        # Fallback to standard 1-to-1 comparison for fuzzy reads
+        min_dist = max_edits + 1
+
         for bc in self.known_barcodes:
-            # "NW" means global alignment: it must match end-to-end
-            res = edlib.align(extracted_seq, bc, mode="NW", k=max_edits)
-            if res["editDistance"] != -1:
-                best_matches.add(bc)
+            # Check Forward
+            res_fwd = edlib.align(bc, extracted_seq, mode="HW", task="locations", k=max_edits)
+            if res_fwd["editDistance"] != -1:
+                dist = res_fwd["editDistance"]
+                if dist < min_dist:
+                    min_dist, best_matches = dist, {bc}
+                elif dist == min_dist:
+                    best_matches.add(bc)
+
+            # Check Reverse Complement
+            if self.check_reverse_complement:
+                res_rev = edlib.align(bc, rc_extracted, mode="HW", task="locations", k=max_edits)
+                if res_rev["editDistance"] != -1:
+                    dist = res_rev["editDistance"]
+                    if dist < min_dist:
+                        min_dist, best_matches = dist, {bc}
+                    elif dist == min_dist:
+                        best_matches.add(bc)
 
         if not best_matches:
             return None, MappingResult.BARCODE_UNRECOGNISED
-
         if len(best_matches) > 1:
             return None, MappingResult.BARCODE_AMBIGUOUS
 
@@ -351,7 +372,6 @@ def get_flanks(
 # =============================================================================
 # Main Pipeline
 # =============================================================================
-
 def run_pipeline(
         fastq_path: str,
         plasmid_library: dict[str, dict[str, str]],
@@ -364,13 +384,13 @@ def run_pipeline(
         minimap2_preset: str = "splice",
         minimap2_kmer: Optional[int] = None,
         minimap2_w: Optional[int] = None,
+        check_reverse_complement: bool = True,  # <-- Added here
 ) -> PipelineStats:
     logger.info("Initialising aligners and barcode matcher...")
 
     # Automatically infer expected barcode length from the library keys
     inferred_bc_len = len(next(iter(plasmid_library)))
 
-    # Pass the new arguments down to the builder
     aligners = build_aligner_dict(
         plasmid_library,
         preset=minimap2_preset,
@@ -380,7 +400,8 @@ def run_pipeline(
 
     header, ref_map = create_bam_header(plasmid_library)
 
-    matcher = BarcodeMatcher(sorted(plasmid_library.keys()))
+    # Pass the flag into the matcher
+    matcher = BarcodeMatcher(sorted(plasmid_library.keys()), check_reverse_complement=check_reverse_complement)
     stats = PipelineStats()
 
     temp_bam_fd, temp_bam_path = tempfile.mkstemp(suffix=".bam")
@@ -491,6 +512,8 @@ def main():
 
     # --- Alignment & Matching Settings ---
     align_group = parser.add_argument_group("Alignment & Matching Settings")
+    align_group.add_argument("--check_reverse_complement", choices=["True", "False"], default="True",
+                             help="Check the reverse complement of the barcode (default: True). Must be False for positional extraction.")
     align_group.add_argument("--minimum_distance", type=int, default=0,
                              help="Max edit distance for fuzzy barcode matching (default: 0).")
     align_group.add_argument("--minimap2_preset", default="-ax splice",
@@ -502,10 +525,16 @@ def main():
 
     args = parser.parse_args()
 
+    check_rc = args.check_reverse_complement == "True"
+
     # --- Basic Validation Logic ---
     # Ensure Option 1 requirements are met if using wildcards
     if args.wildcard and not args.csv:
         parser.error("Option 1 requires a CSV file (-c/--csv) when providing a wildcard (-wc/--wildcard).")
+
+    if args.barcode_start_pos is not None and check_rc:
+        parser.error(
+            "When using positional extraction (--barcode_start_pos), you must set --check_reverse_complement False.")
 
     # Ensure Option 2 requirements are met if using rname_equals_barcode
     if args.rname_equals_barcode:
