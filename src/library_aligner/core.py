@@ -22,7 +22,6 @@ import pybktree
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-
 # =============================================================================
 # Data Models & Enums
 # =============================================================================
@@ -307,6 +306,7 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
             a.is_read1 = True
             a.is_reverse = (aln.strand == -1)
             a.is_supplementary = not aln.is_primary
+            a.set_tag("BC", barcode)
 
             if aln2 is not None:
                 a.next_reference_id = ref_id
@@ -343,6 +343,7 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
             a.mate_is_reverse = (aln1.strand == -1)
             a.is_proper_pair = aln.is_primary
             a.template_length = -tlen  # R2 gets the negated R1 TLEN
+            a.set_tag("BC", barcode)
 
             set_sequence(a, seq2, q_arr2)
             a.cigar = build_cigar(aln, len(seq2))
@@ -364,6 +365,8 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
             a.next_reference_start = aln1.r_st
             a.mate_is_reverse = (aln1.strand == -1)
             a.query_sequence = seq2
+            a.set_tag("BC", barcode)
+
             if q_arr2 is not None:
                 a.query_qualities = q_arr2
             bam_writer.write(a)
@@ -379,6 +382,7 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
         a.mapping_quality = aln.mapq
         a.is_reverse = (aln.strand == -1)
         a.is_supplementary = not aln.is_primary
+        a.set_tag("BC", barcode)
 
         set_sequence(a, seq1, q_arr1)
         a.cigar = build_cigar(aln, len(seq1))
@@ -418,11 +422,10 @@ class LazyAlignerDict:
 
 
 def build_aligner_dict(plasmid_references, preset="splice", kmer=None, w_score=None, cache=True):
-    clean_preset = preset.replace("-ax ", "").replace("-x ", "").strip()
 
     if not cache:
         logger.info("Aligner caching disabled (--no_mappy_cache). Aligners will be built on the fly.")
-        return LazyAlignerDict(plasmid_references, clean_preset, kmer, w_score)
+        return LazyAlignerDict(plasmid_references, preset, kmer, w_score)
 
     aligners = {}
     seq_to_aligner = {}  # keyed on actual sequence — safe regardless of wildcard usage
@@ -430,12 +433,12 @@ def build_aligner_dict(plasmid_references, preset="splice", kmer=None, w_score=N
     for barcode, ref_data in plasmid_references.items():
         seq = ref_data["seq"]
         if seq not in seq_to_aligner:
-            kwargs = {"seq": seq, "preset": clean_preset, "min_chain_score": 25}
+            kwargs = {"seq": seq, "preset": preset, "min_chain_score": 25}
             if kmer is not None: kwargs["k"] = kmer
             if w_score is not None: kwargs["w"] = w_score
             aligner = mappy.Aligner(**kwargs)
             if not aligner:
-                raise RuntimeError(f"Failed to load reference for barcode '{barcode}' using preset '{clean_preset}'")
+                raise RuntimeError(f"Failed to load reference for barcode '{barcode}' using preset '{preset}'")
             seq_to_aligner[seq] = aligner
         aligners[barcode] = seq_to_aligner[seq]
 
@@ -583,9 +586,6 @@ def run_pipeline(
 
     temp_bam_fd, temp_bam_path = tempfile.mkstemp(suffix=".bam")
     os.close(temp_bam_fd)
-
-    f5_rev = mappy.revcomp(f3_fwd) if f3_fwd else None
-    f3_rev = mappy.revcomp(f5_fwd) if f5_fwd else None
 
     try:
         logger.info("Processing reads...")
@@ -743,8 +743,10 @@ def main():
                              help="Check the reverse complement of the barcode (default: True). Must be False for positional extraction.")
     align_group.add_argument("--minimum_distance", type=int, default=0,
                              help="Max edit distance for fuzzy barcode matching (default: 0).")
-    align_group.add_argument("--minimap2_preset", default="-ax splice",
-                             help="Minimap2 preset (default: '-ax splice').")
+    align_group.add_argument("--minimap2_preset", default="splice",
+                             help="Minimap2 preset (default: 'splice').", choices=["lr", "map-ont", "ava-ont", "map-pb", "ava-pb",
+             "map-hifi", "map-ccs", "asm5", "asm10", "asm20",
+             "short", "sr", "splice", "splice:hq", "splice:sr", "cdna"])
     align_group.add_argument("--minimap2_kmer", type=int,
                              help="Minimap2 k-mer length (-k).", default=10)
     align_group.add_argument("--minimap2_w", type=int,
@@ -766,27 +768,27 @@ def main():
         fuzzy_mode = "NW" if args.barcode_start_pos is not None else "HW"
 
     # --- Basic Validation Logic ---
-        # Check if the user has provided AT LEAST one flank
-        has_any_flank = bool(args.five_prime_flank or args.three_prime_flank)
+    # Check if the user has provided AT LEAST one flank
+    has_any_flank = bool(args.five_prime_flank or args.three_prime_flank)
 
-        is_exact_positional = not args.wildcard and not has_any_flank and (args.barcode_start_pos is not None)
+    is_exact_positional = not args.wildcard and not has_any_flank and (args.barcode_start_pos is not None)
 
-        if args.wildcard and not args.csv:
-            parser.error("Option 1 requires a CSV file (-c/--csv) when providing a wildcard (-wc/--wildcard).")
+    if args.wildcard and not args.csv:
+        parser.error("Option 1 requires a CSV file (-c/--csv) when providing a wildcard (-wc/--wildcard).")
 
-        if is_exact_positional and check_rc:
+    if is_exact_positional and check_rc:
+        parser.error(
+            "When using exact positional extraction (no flanks/wildcards), you must set --check_reverse_complement False.")
+
+    if args.barcode_read == 2 and not args.fastq2:
+        parser.error("--barcode_read 2 requires a paired FASTQ (--fastq2).")
+
+    if args.rname_equals_barcode:
+        if args.wildcard:
+            parser.error("Cannot use --wildcard and --rname_equals_barcode together.")
+        if not has_any_flank and not is_exact_positional:
             parser.error(
-                "When using exact positional extraction (no flanks/wildcards), you must set --check_reverse_complement False.")
-
-        if args.barcode_read == 2 and not args.fastq2:
-            parser.error("--barcode_read 2 requires a paired FASTQ (--fastq2).")
-
-        if args.rname_equals_barcode:
-            if args.wildcard:
-                parser.error("Cannot use --wildcard and --rname_equals_barcode together.")
-            if not has_any_flank and not is_exact_positional:
-                parser.error(
-                    "Option 2 requires at least one flank (--five_prime_flank and/or --three_prime_flank) OR exact absolute positions (--barcode_start_pos/--barcode_end_pos).")
+                "Option 2 requires at least one flank (--five_prime_flank and/or --three_prime_flank) OR exact absolute positions (--barcode_start_pos/--barcode_end_pos).")
 
     try:
         # 1. Determine Flanks

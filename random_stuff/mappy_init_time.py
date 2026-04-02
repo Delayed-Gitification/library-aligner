@@ -14,7 +14,7 @@ def random_seq(length: int) -> str:
     return "".join(random.choices("ACGT", k=length))
 
 
-def bench_init(n_iters: int, ref_len: int, preset: str = "splice", barcode_len: int = 15):
+def bench_init(n_iters: int, ref_len: int, preset: str = "sr:splice", barcode_len: int = 15):
     backbone = random_seq(ref_len - barcode_len)
     insert_pos = ref_len // 2
 
@@ -57,7 +57,7 @@ if __name__ == "__main__":
         bench_init(N, ref_len=ref_len)
 
     print(f"\n--- Vary preset (ref_len=10,000, n={N}) ---")
-    for preset in ["splice", "map-ont", "sr"]:
+    for preset in ["splice", "map-ont", "sr", "sr:splice"]:
         print(f"  preset={preset}")
         bench_init(N, ref_len=10_000, preset=preset)
 

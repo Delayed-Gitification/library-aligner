@@ -126,7 +126,7 @@ def test_illumina_single_end(tmp_path):
         "-o", str(out_bam),
         "--barcode_start_pos", "10",  # <-- CRITICAL: Direct positional slicing
         "--barcode_end_pos", "25",  # <-- 15bp slice
-        "--minimap2_preset", "-ax sr:splice",  # <-- Requested preset
+        "--minimap2_preset", "splice:sr",  # <-- Requested preset
         "--minimum_distance", "1",  # Illumina is clean, 1 edit is plenty
         "--check_reverse_complement", "False"
     ]
