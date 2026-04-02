@@ -1,0 +1,242 @@
+---
+title: "library-aligner benchmarking"
+author: "Oscar G Wilkins"
+format: html
+editor: visual
+---
+
+```{r setup}
+library(reticulate)
+use_condaenv("library_aligner", conda = "/Users/ogw/miniconda3/bin/conda")
+```
+
+```{r}
+reticulate::py_config()
+```
+
+```{python}
+import mappy
+import pysam
+import edlib
+import subprocess
+import time
+import tracemalloc
+print("All imports OK")
+```
+
+```{python}
+import os
+import gzip
+import random
+
+def mutate_seq(seq, error_rate, rng):
+    bases = ['A', 'C', 'G', 'T']
+    return "".join(
+        rng.choice([b for b in bases if b != c]) if rng.random() < error_rate else c
+        for c in seq
+    )
+
+def generate_benchmark_data(out_dir, num_barcodes, read_depth=100, seed=42, backbone_error_rate=0.05):
+    rng = random.Random(seed)
+    os.makedirs(out_dir, exist_ok=True)
+
+    fasta_path = os.path.join(out_dir, "reference.fasta")
+    csv_path = os.path.join(out_dir, "linkage.csv")
+    fastq_path = os.path.join(out_dir, "reads.fastq.gz")
+
+    f5 = "ACGTACGTAC"
+    f3 = "TGCATGCATG"
+    wildcard = "NNNNNNNNNNNNNNN"
+    bases = ['A', 'C', 'G', 'T']
+
+    # One canonical backbone
+    backbone_l = "".join(rng.choices(bases, k=100))
+    backbone_r = "".join(rng.choices(bases, k=100))
+    canonical_template = backbone_l + f5 + wildcard + f3 + backbone_r
+
+    barcodes = ["".join(rng.choices(bases, k=15)) for _ in range(num_barcodes)]
+
+    with open(fasta_path, "w") as fa, open(csv_path, "w") as csv_f:
+        csv_f.write("barcode,rname\n")
+        for i, bc in enumerate(barcodes):
+            # Each reference gets a slightly mutated backbone
+            mut_l = mutate_seq(backbone_l, backbone_error_rate, rng)
+            mut_r = mutate_seq(backbone_r, backbone_error_rate, rng)
+            template = mut_l + f5 + wildcard + f3 + mut_r
+            rname = f"Ref_{i}"
+            fa.write(f">{rname}\n{template}\n")
+            csv_f.write(f"{bc},{rname}\n")
+
+    with gzip.open(fastq_path, "wt") as fq:
+        for i, bc in enumerate(barcodes):
+            # Reads come from the mutated backbone for this barcode
+            mut_l = mutate_seq(backbone_l, backbone_error_rate, rng)
+            mut_r = mutate_seq(backbone_r, backbone_error_rate, rng)
+            template = mut_l + f5 + wildcard + f3 + mut_r
+            resolved = template.replace(wildcard, bc)
+            for j in range(read_depth):
+                fq.write(f"@read_{bc}_{j}\n{resolved}\n+\n{'I' * len(resolved)}\n")
+
+    return fasta_path, csv_path, fastq_path, barcodes
+
+# Test at small scale
+fasta, csv, fastq, barcodes = generate_benchmark_data(
+    "/tmp/la_bench/test_10", num_barcodes=10, read_depth=5
+)
+print(f"Generated {len(barcodes)} barcodes, FASTA: {fasta}")
+```
+
+```{python}
+import pandas as pd
+
+def generate_naive_fasta(out_dir, fasta_path, csv_path):
+    """
+    Build a concatenated multi-reference FASTA where each barcode
+    gets its own entry — the naive approach a user would normally take.
+    """
+    naive_fasta_path = os.path.join(out_dir, "naive_reference.fasta")
+
+    # Read all reference sequences
+    references = {}
+    current_name = None
+    with open(fasta_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                current_name = line[1:]
+                references[current_name] = ""
+            else:
+                references[current_name] += line
+
+    wildcard = "NNNNNNNNNNNNNNN"
+    df = pd.read_csv(csv_path)
+
+    with open(naive_fasta_path, "w") as fa:
+        for _, row in df.iterrows():
+            bc = row["barcode"]
+            rname = row["rname"]
+            template = references[rname]
+            resolved = template.replace(wildcard, bc)
+            fa.write(f">{bc}\n{resolved}\n")
+
+    return naive_fasta_path
+
+print("Naive FASTA generator updated")
+
+# Test it
+naive_fasta = generate_naive_fasta("/tmp/la_bench/test_10", fasta, csv)
+print(f"Naive FASTA written: {naive_fasta}")
+```
+
+```{python}
+import psutil
+
+def benchmark_library_aligner(fasta_path, csv_path, fastq_path, out_dir, preset="splice", kmer=10, w=4):
+    """Run library-aligner and measure wall time and peak memory."""
+    out_bam = os.path.join(out_dir, "la_output.bam")
+    
+    cmd = [
+        "/Users/ogw/miniconda3/envs/library_aligner/bin/python",
+        "/Users/ogw/Documents/GitHub/library-aligner/src/library_aligner/core.py",
+        "-fq", fastq_path,
+        "-fa", fasta_path,
+        "-c", csv_path,
+        "-o", out_bam,
+        "-wc", "NNNNNNNNNNNNNNN",
+        "--minimap2_preset", preset,
+        "--minimap2_kmer", str(kmer),
+        "--minimap2_w", str(w),
+    ]
+    
+    start = time.time()
+    proc = subprocess.Popen(cmd)
+    ps_proc = psutil.Process(proc.pid)
+    
+    peak_mem = 0
+    while proc.poll() is None:
+        try:
+            mem = ps_proc.memory_info().rss
+            if mem > peak_mem:
+                peak_mem = mem
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.05)
+    
+    elapsed = time.time() - start
+    return elapsed, peak_mem / 1024**2, out_bam
+
+
+
+def benchmark_naive(naive_fasta_path, fastq_path, out_dir, preset="splice", kmer=10, w=4):
+    out_sam = os.path.join(out_dir, "naive_output.sam")
+    
+    cmd = [
+        "minimap2",
+        "-ax", preset,
+        "-k", str(kmer),
+        "-w", str(w),
+        naive_fasta_path,
+        fastq_path,
+        "-o", out_sam,
+    ]
+    
+    start = time.time()
+    proc = subprocess.Popen(cmd)
+    ps_proc = psutil.Process(proc.pid)
+    
+    peak_mem = 0
+    while proc.poll() is None:
+        try:
+            mem = ps_proc.memory_info().rss
+            if mem > peak_mem:
+                peak_mem = mem
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.05)
+    
+    elapsed = time.time() - start
+    return elapsed, peak_mem / 1024**2, out_sam
+
+print("Benchmark functions defined")
+```
+
+```{python}
+import pandas as pd
+
+scales = [10, 50, 100, 500, 1000]
+results = []
+
+PRESET = "splice"
+KMER = 10
+W = 4
+
+for n in scales:
+    print(f"Running scale: {n} barcodes...")
+    out_dir = f"/tmp/la_bench/scale_{n}"
+    
+    fasta, csv, fastq, barcodes = generate_benchmark_data(
+        out_dir, num_barcodes=n, read_depth=100
+    )
+    naive_fasta = generate_naive_fasta(out_dir, fasta, csv)
+    
+    la_time, la_mem, la_bam = benchmark_library_aligner(
+        fasta, csv, fastq, out_dir, preset=PRESET, kmer=KMER, w=W
+    )
+    naive_time, naive_mem, naive_sam = benchmark_naive(
+        naive_fasta, fastq, out_dir, preset=PRESET, kmer=KMER, w=W
+    )
+    
+    results.append({
+        "n_barcodes": n,
+        "la_time": la_time,
+        "la_mem": la_mem,
+        "naive_time": naive_time,
+        "naive_mem": naive_mem,
+    })
+    print(f"  library-aligner: {la_time:.1f}s, {la_mem:.0f}MB")
+    print(f"  naive:           {naive_time:.1f}s, {naive_mem:.0f}MB")
+
+results_df = pd.DataFrame(results)
+results_df.to_csv("/tmp/la_bench/results.csv", index=False)
+print(results_df)
+```
