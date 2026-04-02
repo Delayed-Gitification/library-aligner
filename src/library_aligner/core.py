@@ -1,7 +1,6 @@
 import os
 import tempfile
 import logging
-import bisect
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -10,6 +9,7 @@ import edlib
 import pysam
 import pandas as pd
 import argparse
+import pybktree
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,15 +52,27 @@ class PipelineStats:
 # =============================================================================
 
 class BarcodeMatcher:
-    def __init__(self, known_barcodes: list[str], check_reverse_complement: bool = True):
+    def __init__(self, known_barcodes: list[str], check_reverse_complement: bool = True, fuzzy_mode: str = "NW"):
         self.known_barcodes = known_barcodes
         self.exact_set = set(known_barcodes)
         self.check_reverse_complement = check_reverse_complement
 
+        def _dist(a, b):
+            return edlib.align(a, b, mode=fuzzy_mode, task="distance")["editDistance"]
+
+        # Build once at init — O(N log N), paid once
+        self.tree = pybktree.BKTree(_dist, known_barcodes)
+
+        if check_reverse_complement:
+            self.rc_to_original = {mappy.revcomp(bc): bc for bc in known_barcodes}
+            if len(self.rc_to_original) != len(known_barcodes):
+                raise ValueError("Two barcodes in the library are reverse complements of each other.")
+            self.rc_tree = pybktree.BKTree(_dist, list(self.rc_to_original.keys()))
+
     def match(self, extracted_seq: str, max_edits: int = 2) -> tuple[Optional[str], MappingResult]:
         rc_extracted = mappy.revcomp(extracted_seq) if self.check_reverse_complement else None
 
-        # 1. Fast Path: Exact Match
+        # 1. Fast path: exact match — O(1)
         if extracted_seq in self.exact_set:
             return extracted_seq, MappingResult.SUCCESS
         if self.check_reverse_complement and rc_extracted in self.exact_set:
@@ -69,37 +81,23 @@ class BarcodeMatcher:
         if max_edits < 1:
             return None, MappingResult.BARCODE_UNRECOGNISED
 
-        # 2. Fuzzy Path: Infix (HW) Search
-        best_matches = set()
-        min_dist = max_edits + 1
+        # 2. Fuzzy path: BK-tree query — O(log N) average
+        fwd_hits = self.tree.find(extracted_seq, max_edits)  # [(dist, bc), ...]
+        rev_hits = self.rc_tree.find(rc_extracted, max_edits) if self.check_reverse_complement else []
 
-        for bc in self.known_barcodes:
-            # Check Forward
-            res_fwd = edlib.align(bc, extracted_seq, mode="HW", task="locations", k=max_edits)
-            if res_fwd["editDistance"] != -1:
-                dist = res_fwd["editDistance"]
-                if dist < min_dist:
-                    min_dist, best_matches = dist, {bc}
-                elif dist == min_dist:
-                    best_matches.add(bc)
+        all_hits = list(fwd_hits)  # [(dist, bc) for dist, bc in fwd_hits]
+        all_hits += [(dist, self.rc_to_original[bc]) for dist, bc in rev_hits]
 
-            # Check Reverse Complement
-            if self.check_reverse_complement:
-                res_rev = edlib.align(bc, rc_extracted, mode="HW", task="locations", k=max_edits)
-                if res_rev["editDistance"] != -1:
-                    dist = res_rev["editDistance"]
-                    if dist < min_dist:
-                        min_dist, best_matches = dist, {bc}
-                    elif dist == min_dist:
-                        best_matches.add(bc)
-
-        if not best_matches:
+        if not all_hits:
             return None, MappingResult.BARCODE_UNRECOGNISED
-        if len(best_matches) > 1:
+
+        min_dist = min(dist for dist, _ in all_hits)
+        best = {bc for dist, bc in all_hits if dist == min_dist}
+
+        if len(best) > 1:
             return None, MappingResult.BARCODE_AMBIGUOUS
 
-        return best_matches.pop(), MappingResult.SUCCESS
-
+        return best.pop(), MappingResult.SUCCESS
 
 def extract_barcode_sequence(
         read_seq: str, f5_fwd=None, f3_fwd=None, f5_rev=None, f3_rev=None,
@@ -146,132 +144,158 @@ def extract_barcode_sequence(
 # BAM Handling
 # =============================================================================
 
-def _build_aligned_segment(
-        bam_writer: pysam.AlignmentFile,
-        ref_id: int,
-        read_name: str,
-        read_seq: str,
-        aln: mappy.Alignment,
-        cached_qual_array,
-) -> pysam.AlignedSegment:
-    """Constructs a pysam AlignedSegment using SOFT clipping."""
-    a = pysam.AlignedSegment(bam_writer.header)
-    a.query_name = read_name
-    a.reference_id = ref_id
-    a.reference_start = aln.r_st
-    a.mapping_quality = aln.mapq
-    a.is_supplementary = not aln.is_primary
-    a.is_reverse = (aln.strand == -1)
 
-    read_len = len(read_seq)
-    clip_left = aln.q_st
-    clip_right = read_len - aln.q_en
+def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, aligners_dict,
+                           seq2=None, qual2=None, min_mapq=0):
 
-    cigar = [(op, length) for length, op in aln.cigar]
-
-    if aln.strand == 1:
-        if clip_left > 0:
-            cigar.insert(0, (4, clip_left))
-        if clip_right > 0:
-            cigar.append((4, clip_right))
-    else:
-        if clip_right > 0:
-            cigar.insert(0, (4, clip_right))
-        if clip_left > 0:
-            cigar.append((4, clip_left))
-
-    a.cigar = cigar
-
-    if a.is_supplementary:
-        a.query_sequence = None
-        a.query_qualities = None
-    else:
-        if a.is_reverse:
-            a.query_sequence = mappy.revcomp(read_seq)
-            if cached_qual_array is not None:
-                a.query_qualities = cached_qual_array[::-1]
-        else:
-            a.query_sequence = read_seq
-            if cached_qual_array is not None:
-                a.query_qualities = cached_qual_array
-    return a
-
-
-def process_and_write_read(bam_writer, ref_id, name, seq, qual, barcode, aligners_dict,
-                           min_mapq=0):  # FIX: Dropped min_mapq to 0 for mini-reads
     aligner = aligners_dict.get(barcode)
-    if not aligner: return MappingResult.BARCODE_UNRECOGNISED
+    if not aligner:
+        raise RuntimeError(
+            f"No aligner found for barcode '{barcode}' — this is a bug, barcode should have been validated before reaching this point.")
 
-    alns = [a for a in aligner.map(seq) if a.mapq >= min_mapq]
-    if not alns: return MappingResult.MAPPING_FAILED
+    alns1 = [a for a in aligner.map(seq1) if a.mapq >= min_mapq]
+    if not alns1:
+        return MappingResult.MAPPING_FAILED
 
-    q_arr = pysam.qualitystring_to_array(qual) if qual else None
-    for aln in alns:
-        a = pysam.AlignedSegment(bam_writer.header)
-        a.query_name, a.reference_id, a.reference_start, a.mapping_quality = name, ref_id, aln.r_st, aln.mapq
-        a.is_reverse = (aln.strand == -1)
+    q_arr1 = pysam.qualitystring_to_array(qual1) if qual1 else None
 
+    def build_cigar(aln, seq_len):
         cigar = [(op, length) for length, op in aln.cigar]
-        clip_l, clip_r = aln.q_st, len(seq) - aln.q_en
+        clip_l, clip_r = aln.q_st, seq_len - aln.q_en
         if aln.strand == 1:
             if clip_l > 0: cigar.insert(0, (4, clip_l))
             if clip_r > 0: cigar.append((4, clip_r))
         else:
             if clip_r > 0: cigar.insert(0, (4, clip_r))
             if clip_l > 0: cigar.append((4, clip_l))
-        a.cigar = cigar
+        return cigar
 
-        if not (not aln.is_primary):
-            if a.is_reverse:
-                a.query_sequence = mappy.revcomp(seq)
-                if q_arr is not None: a.query_qualities = q_arr[::-1]
+    def set_sequence(a, seq, q_arr, aln):
+        # Sequence and qualities must be set BEFORE cigar
+        if a.is_reverse:
+            a.query_sequence = mappy.revcomp(seq)
+            if q_arr is not None:
+                a.query_qualities = q_arr[::-1]
+        else:
+            a.query_sequence = seq
+            if q_arr is not None:
+                a.query_qualities = q_arr
+
+    # --- Paired-end path ---
+    if seq2 is not None:
+        alns2 = [a for a in aligner.map(seq2) if a.mapq >= min_mapq]
+        q_arr2 = pysam.qualitystring_to_array(qual2) if qual2 else None
+
+        # Best primary alignment from each read — used for mate coordinate fields
+        aln1 = alns1[0]
+        aln2 = alns2[0] if alns2 else None
+
+        tlen = (aln2.r_st - aln1.r_st) if aln2 is not None else 0
+
+        for aln in alns1:
+            a = pysam.AlignedSegment(bam_writer.header)
+            a.query_name = name
+            a.reference_id = ref_id
+            a.reference_start = aln.r_st
+            a.mapping_quality = aln.mapq
+            a.is_paired = True
+            a.is_read1 = True
+            a.is_reverse = (aln.strand == -1)
+            a.is_supplementary = not aln.is_primary
+
+            if aln2 is not None:
+                a.next_reference_id = ref_id
+                a.next_reference_start = aln2.r_st
+                a.mate_is_reverse = (aln2.strand == -1)
+                a.is_proper_pair = aln.is_primary  # only flag proper pair on primary
+                a.template_length = tlen
             else:
-                a.query_sequence = seq
-                if q_arr is not None: a.query_qualities = q_arr
-        bam_writer.write(a)
-    return MappingResult.SUCCESS
+                a.next_reference_id = ref_id
+                a.next_reference_start = aln.r_st
+                a.mate_is_unmapped = True
 
+            # Sequence → qualities → cigar
+            set_sequence(a, seq1, q_arr1, aln)
+            a.cigar = build_cigar(aln, len(seq1))
+            bam_writer.write(a)
+
+        for aln in (alns2 if alns2 else []):
+            a = pysam.AlignedSegment(bam_writer.header)
+            a.query_name = name
+            a.reference_id = ref_id
+            a.reference_start = aln.r_st
+            a.mapping_quality = aln.mapq
+            a.is_paired = True
+            a.is_read2 = True
+            a.is_reverse = (aln.strand == -1)
+            a.is_supplementary = not aln.is_primary
+            a.next_reference_id = ref_id
+            a.next_reference_start = aln1.r_st
+            a.mate_is_reverse = (aln1.strand == -1)
+            a.is_proper_pair = aln.is_primary
+            a.template_length = -tlen
+
+            set_sequence(a, seq2, q_arr2, aln)
+            a.cigar = build_cigar(aln, len(seq2))
+            bam_writer.write(a)
+
+        # Unmapped R2 placeholder
+        if not alns2:
+            a = pysam.AlignedSegment(bam_writer.header)
+            a.query_name = name
+            a.is_paired = True
+            a.is_read2 = True
+            a.is_unmapped = True
+            a.reference_id = ref_id
+            a.reference_start = aln1.r_st  # convention: use mate's position
+            a.next_reference_id = ref_id
+            a.next_reference_start = aln1.r_st
+            a.mate_is_reverse = (aln1.strand == -1)
+            a.query_sequence = seq2
+            if q_arr2 is not None:
+                a.query_qualities = q_arr2
+            bam_writer.write(a)
+
+        return MappingResult.SUCCESS
+
+    # --- Single-end path ---
+    for aln in alns1:
+        a = pysam.AlignedSegment(bam_writer.header)
+        a.query_name = name
+        a.reference_id = ref_id
+        a.reference_start = aln.r_st
+        a.mapping_quality = aln.mapq
+        a.is_reverse = (aln.strand == -1)
+        a.is_supplementary = not aln.is_primary
+
+        set_sequence(a, seq1, q_arr1, aln)
+        a.cigar = build_cigar(aln, len(seq1))
+        bam_writer.write(a)
+
+    return MappingResult.SUCCESS
 
 # =============================================================================
 # Setup Helpers
 # =============================================================================
 
-def build_aligner_dict(
-        plasmid_references: dict[str, dict[str, str]],
-        preset: str = "splice",
-        kmer: Optional[int] = None,
-        w_score: Optional[int] = None
-) -> dict[str, mappy.Aligner]:
-    """Initialises splice-aware mappy aligners using custom settings."""
+def build_aligner_dict(plasmid_references, preset="splice", kmer=None, w_score=None):
     aligners = {}
-
-    # Clean up common CLI prefixes if the user types "-ax splice" instead of "splice"
     clean_preset = preset.replace("-ax ", "").replace("-x ", "").strip()
+    seq_to_aligner = {}  # keyed on actual sequence — safe regardless of wildcard usage
 
     for barcode, ref_data in plasmid_references.items():
-        # Build the base arguments
-        kwargs = {
-            "seq": ref_data["seq"],
-            "preset": clean_preset,
-            "min_chain_score": 25
-        }
-
-        # Only add k and w if the user explicitly provided them
-        if kmer is not None:
-            kwargs["k"] = kmer
-        if w_score is not None:
-            kwargs["w"] = w_score
-
-        # Unpack the dictionary into the Aligner
-        aligner = mappy.Aligner(**kwargs)
-
-        if not aligner:
-            raise RuntimeError(f"Failed to load reference for barcode: {barcode} using preset '{clean_preset}'")
-
-        aligners[barcode] = aligner
+        seq = ref_data["seq"]
+        if seq not in seq_to_aligner:
+            kwargs = {"seq": seq, "preset": clean_preset, "min_chain_score": 25}
+            if kmer is not None: kwargs["k"] = kmer
+            if w_score is not None: kwargs["w"] = w_score
+            aligner = mappy.Aligner(**kwargs)
+            if not aligner:
+                raise RuntimeError(f"Failed to load reference for barcode '{barcode}' using preset '{clean_preset}'")
+            seq_to_aligner[seq] = aligner
+        aligners[barcode] = seq_to_aligner[seq]
 
     return aligners
-
 
 def create_bam_header(plasmid_references: dict[str, dict[str, str]]) -> tuple[dict, dict[str, int]]:
     """Builds unified SAM header with unique reference names."""
@@ -384,7 +408,10 @@ def run_pipeline(
         minimap2_preset: str = "splice",
         minimap2_kmer: Optional[int] = None,
         minimap2_w: Optional[int] = None,
-        check_reverse_complement: bool = True,  # <-- Added here
+        check_reverse_complement: bool = True,
+        fastq2_path: Optional[str] = None,       # <-- new
+        barcode_read: int = 1,
+        fuzzy_mode: str = 'HW',# <-- new
 ) -> PipelineStats:
     logger.info("Initialising aligners and barcode matcher...")
 
@@ -401,7 +428,11 @@ def run_pipeline(
     header, ref_map = create_bam_header(plasmid_library)
 
     # Pass the flag into the matcher
-    matcher = BarcodeMatcher(sorted(plasmid_library.keys()), check_reverse_complement=check_reverse_complement)
+    matcher = BarcodeMatcher(
+        sorted(plasmid_library.keys()),
+        check_reverse_complement=check_reverse_complement,
+        fuzzy_mode=fuzzy_mode
+    )
     stats = PipelineStats()
 
     temp_bam_fd, temp_bam_path = tempfile.mkstemp(suffix=".bam")
@@ -413,14 +444,32 @@ def run_pipeline(
     try:
         logger.info("Processing reads...")
         with pysam.AlignmentFile(temp_bam_path, "wb", header=header) as unsorted_bam:
-            for name, seq, qual in mappy.fastx_read(fastq_path):
+
+            read_iter = mappy.fastx_read(fastq_path)
+            read2_iter = mappy.fastx_read(fastq2_path) if fastq2_path else None
+
+            for r1 in read_iter:
+                name1, seq1, qual1 = r1
+
+                if read2_iter is not None:
+                    r2 = next(read2_iter, None)
+                    if r2 is None:
+                        logger.warning("R2 exhausted before R1 — FASTQs may be mismatched.")
+                        break
+                    name2, seq2, qual2 = r2
+                else:
+                    seq2, qual2 = None, None
+
                 stats.processed += 1
                 if stats.processed % 10_000 == 0:
                     logger.info(f"Processed {stats.processed:,} reads...")
 
+                # Route barcode extraction to the correct read
+                bc_seq = seq1 if (barcode_read == 1 or seq2 is None) else seq2
+
                 raw_extracted = extract_barcode_sequence(
-                    seq, f5_fwd, f3_fwd, f5_rev, f3_rev,
-                    expected_bc_len=inferred_bc_len,  # <-- Dynamically injected
+                    bc_seq, f5_fwd, f3_fwd, f5_rev, f3_rev,
+                    expected_bc_len=inferred_bc_len,
                     start_pos=barcode_start_pos,
                     end_pos=barcode_end_pos
                 )
@@ -442,7 +491,8 @@ def run_pipeline(
                 correct_rname = plasmid_library[matched_barcode]["rname"]
                 ref_id = ref_map[correct_rname]
                 result = process_and_write_read(
-                    unsorted_bam, ref_id, name, seq, qual, matched_barcode, aligners
+                    unsorted_bam, ref_id, name1, seq1, qual1, matched_barcode, aligners,
+                    seq2=seq2, qual2=qual2
                 )
 
                 if result == MappingResult.SUCCESS:
@@ -466,8 +516,8 @@ def run_pipeline(
 # Execution
 # =============================================================================
 
-import argparse
 import sys
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -509,6 +559,8 @@ def main():
                            help="0-based start index of the barcode (for deterministic reads like Illumina).")
     loc_group.add_argument("--barcode_end_pos", type=int,
                            help="0-based end index of the barcode.")
+    loc_group.add_argument("--barcode_read", type=int, choices=[1, 2], default=1,
+                           help="Which read the barcode is on when using positional extraction (default: 1).")
 
     # --- Alignment & Matching Settings ---
     align_group = parser.add_argument_group("Alignment & Matching Settings")
@@ -522,10 +574,19 @@ def main():
                              help="Minimap2 k-mer length (-k).")
     align_group.add_argument("--minimap2_w", type=int,
                              help="Minimap2 minimizer window size (-w).")
+    align_group.add_argument("--fuzzy_mode", choices=["NW", "HW"], default=None,
+                             help="Edit distance mode for fuzzy barcode matching. NW=global (Illumina), HW=infix (ONT). Auto-inferred if not set.")
 
     args = parser.parse_args()
 
     check_rc = args.check_reverse_complement == "True"
+
+    if args.fuzzy_mode is not None:
+        fuzzy_mode = args.fuzzy_mode
+    else:
+        # Positional extraction = fixed-length barcode = global distance is correct
+        # Flank-based extraction = variable-length extraction = infix distance is safer
+        fuzzy_mode = "NW" if args.barcode_start_pos is not None else "HW"
 
     # --- Basic Validation Logic ---
     # Ensure Option 1 requirements are met if using wildcards
@@ -535,6 +596,13 @@ def main():
     if args.barcode_start_pos is not None and check_rc:
         parser.error(
             "When using positional extraction (--barcode_start_pos), you must set --check_reverse_complement False.")
+
+    if args.fastq2 and args.barcode_read == 2 and args.barcode_start_pos is None:
+        parser.error(
+            "--barcode_read 2 only makes sense with positional extraction (--barcode_start_pos/--barcode_end_pos).")
+
+    if args.barcode_read == 2 and not args.fastq2:
+        parser.error("--barcode_read 2 requires a paired FASTQ (--fastq2).")
 
     # Ensure Option 2 requirements are met if using rname_equals_barcode
     if args.rname_equals_barcode:
@@ -581,9 +649,13 @@ def main():
             barcode_max_edits=args.minimum_distance,
             barcode_start_pos=args.barcode_start_pos,
             barcode_end_pos=args.barcode_end_pos,
-            minimap2_preset=args.minimap2_preset,  # <--- Fixed
-            minimap2_kmer=args.minimap2_kmer,  # <--- Fixed
-            minimap2_w=args.minimap2_w  # <--- Fixed
+            minimap2_preset=args.minimap2_preset,
+            minimap2_kmer=args.minimap2_kmer,
+            minimap2_w=args.minimap2_w,
+            check_reverse_complement=check_rc,
+            fastq2_path=args.fastq2,  # <-- new
+            barcode_read=args.barcode_read,  # <-- new
+            fuzzy_mode=fuzzy_mode,
         )
     except Exception as e:
         logging.error(f"Pipeline failed: {e}")
