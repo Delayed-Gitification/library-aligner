@@ -6,14 +6,14 @@ LA_SCRIPT = "/Users/ogw/Documents/GitHub/library-aligner/src/library_aligner/cor
 OUT_ROOT  = "/Users/ogw/Documents/GitHub/library-aligner/analysis_for_paper/benchmark_data"
 
 WILDCARD = "NNNNNNNNNNNNNNN"   # 15 bp wildcard
-F5       = "ACGTACGTAC"        # 10 bp left flank
-F3       = "TGCATGCATG"        # 10 bp right flank
+F5       = "ACGTACGTAC" + "ACTGAC"        # 10 bp left flank
+F3       = "TGCATGCATG" + "ATTAGG"        # 10 bp right flank
 BASES    = ['A', 'C', 'G', 'T']
 
 # Maximum reads sent to each aligner per condition.
 # Keeping this low makes naive minimap2 tractable at large library sizes
 # while still giving a fair comparison. Change here to affect all experiments.
-MAX_READS = 10
+MAX_READS = 1000
 
 print("Config OK")
 
@@ -88,6 +88,31 @@ def generate_benchmark_data(
     return fasta_path, csv_path, fastq_path, barcodes, ground_truth
 
 
+def generate_naive_mrna_fasta(out_dir, fastq_path, barcodes):
+    """
+    Build a FASTA of spliced mRNA sequences (entry names = barcodes) for use
+    as a badread simulation source in spliced experiments. Unlike naive_fasta
+    which is built from the genomic reference, this is built directly from the
+    noiseless mRNA reads written by generate_spliced_benchmark.
+    """
+    mrna_fasta_path = os.path.join(out_dir, "naive_mrna_reference.fasta")
+    bc_set = set(barcodes)
+    seen   = {}
+    with dnaio.open(fastq_path) as f:
+        for record in f:
+            qname = record.name.split()[0]
+            # read names are read_{i}_{j} — take one representative per barcode
+            parts = qname.split("_")
+            bc_idx = int(parts[1])
+            bc = barcodes[bc_idx]
+            if bc not in seen:
+                seen[bc] = record.sequence
+    with open(mrna_fasta_path, "w") as fa:
+        for bc, seq in seen.items():
+            fa.write(f">{bc}\n{seq}\n")
+    return mrna_fasta_path
+
+
 def generate_naive_fasta(out_dir, fasta_path, csv_path):
     """
     Build a concatenated FASTA where every barcode gets its own entry
@@ -158,8 +183,8 @@ def generate_spliced_benchmark(
             ]
 
             # Barcode placed in exon 1: left + F5 + WILDCARD/bc + F3 + right
-            # Split at 50 bp so the barcode sits within the exon body, not at the edge
-            split       = min(50, len(exons[0]))
+            # Split at 20 bp so the barcode sits within the exon body, not at the very edge
+            split       = min(20, len(exons[0]))
             left, right = exons[0][:split], exons[0][split:]
             exon1_wc    = left + F5 + WILDCARD + F3 + right
             exon1_bc    = left + F5 + bc       + F3 + right
@@ -321,7 +346,7 @@ def _poll_process(proc):
 
 def benchmark_library_aligner(
     fasta_path, csv_path, fastq_path, out_dir,
-    preset="splice", kmer=10, w=4, no_cache=False,
+    preset="splice", kmer=10, w=4, no_cache=False, barcode_max_edits=0,
 ):
     tag     = "nocache" if no_cache else "cached"
     out_bam = os.path.join(out_dir, f"la_{tag}.bam")
@@ -332,6 +357,7 @@ def benchmark_library_aligner(
         "--minimap2_preset", preset,
         "--minimap2_kmer",   str(kmer),
         "--minimap2_w",      str(w),
+        "--max_bc_edit_distance", str(barcode_max_edits),
     ]
     if no_cache:
         cmd.append("--no_mappy_cache")
@@ -394,7 +420,7 @@ def run_experiment(
     label, scales, fixed_kwargs, vary_key, out_root,
     preset="splice", kmer=10, w=4,
     data_fn=generate_benchmark_data,
-    simulator=None,
+    simulator=None, barcode_max_edits=0,
 ):
     """
     Run a benchmark experiment across multiple values of a single parameter
@@ -428,10 +454,11 @@ def run_experiment(
             # Replace the noiseless fastq with simulator output.
             if simulator == "badread":
                 target_reads = MAX_READS * 2
-                with open(naive_fasta) as f:
+                sim_fasta = generate_naive_mrna_fasta(out_dir, fastq, barcodes) if data_fn == generate_spliced_benchmark else naive_fasta
+                with open(sim_fasta) as f:
                     actual_bases = sum(len(l.strip()) for l in f if not l.startswith(">"))
                 quantity = f"{max(1, round((target_reads * 1000) / actual_bases))}x"
-                fastq = simulate_badread(naive_fasta, out_dir, quantity=quantity)
+                fastq = simulate_badread(sim_fasta, out_dir, quantity=quantity)
                 gt    = parse_gt_badread(fastq)
             elif simulator == "art":
                 fastq = simulate_art(naive_fasta, out_dir)
@@ -445,8 +472,8 @@ def run_experiment(
         fastq_sub, gt_sub = subsample_fastq(fastq, gt, MAX_READS, out_dir)
 
         # Run all three aligner configurations on the same subsampled reads
-        la_t,  la_m,  la_bam  = benchmark_library_aligner(fasta, csv, fastq_sub, out_dir, preset, kmer, w)
-        lac_t, lac_m, lac_bam = benchmark_library_aligner(fasta, csv, fastq_sub, out_dir, preset, kmer, w, no_cache=True)
+        la_t,  la_m,  la_bam  = benchmark_library_aligner(fasta, csv, fastq_sub, out_dir, preset, kmer, w, barcode_max_edits=barcode_max_edits)
+        lac_t, lac_m, lac_bam = benchmark_library_aligner(fasta, csv, fastq_sub, out_dir, preset, kmer, w, no_cache=True, barcode_max_edits=barcode_max_edits)
         nv_t,  nv_m,  nv_sam  = benchmark_naive(naive_fasta, fastq_sub, out_dir, preset, kmer, w)
 
         la_acc  = measure_accuracy_la(la_bam,  gt_sub)
@@ -471,7 +498,7 @@ print("Helper functions defined.")
 
 # ── Experiments ───────────────────────────────────────────────────────────────
 
-BARCODE_SCALES = [10, 50, 100, 500, 1000, 5000, 10000]
+BARCODE_SCALES = [500]
 INSERT_LEN     = 400
 ERROR_RATE     = 0.02
 
@@ -560,7 +587,8 @@ df_exp7 = run_experiment(
     data_fn      = generate_spliced_benchmark,
     simulator    = "badread",
     preset       = "splice",
-    kmer         = 10,
-    w            = 4,
+    kmer         = 7,
+    w            = 3,
+    barcode_max_edits = 5,
 )
 print(df_exp7.to_string(index=False))

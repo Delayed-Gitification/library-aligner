@@ -19,6 +19,8 @@ import pandas as pd
 import argparse
 import pybktree
 
+VERBOSE = True
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,13 @@ class BarcodeMatcher:
                 raise ValueError("Two barcodes in the library are reverse complements of each other.")
             self.rc_tree = pybktree.BKTree(_dist, list(self.rc_to_original.keys()))
 
-    def match(self, extracted_seq: str, max_edits: int = 2) -> tuple[Optional[str], MappingResult]:
+    def match(self, extracted_seq: str, max_edits: int = 0) -> tuple[Optional[str], MappingResult]:
+
+        if VERBOSE:
+            print(self.known_barcodes)
+            print(f"max_bc_edit_distance: {max_edits}")
+
+
         rc_extracted = mappy.revcomp(extracted_seq) if self.check_reverse_complement else None
 
         # 1. Fast path: exact match — O(1)
@@ -109,6 +117,42 @@ class BarcodeMatcher:
             return None, MappingResult.BARCODE_AMBIGUOUS
 
         return best.pop(), MappingResult.SUCCESS
+
+
+def _show_alignment(template, read_seq, candidate, f5_fwd, f3_fwd, expected_bc_len):
+    """Print a visual alignment of the scaffold template against the read."""
+    fwd_template = f5_fwd + ("N" * expected_bc_len) + f3_fwd if (f5_fwd and f3_fwd) else template
+    dna_eq = [("N", "A"), ("N", "C"), ("N", "G"), ("N", "T")]
+    res = edlib.align(fwd_template, read_seq, "HW", "locations", k=999, task="path", additionalEqualities=dna_eq)
+    if res["editDistance"] == -1:
+        print("  (no alignment found)")
+        return
+    s, e = res["locations"][0]
+    cigar = res["cigar"]
+    # Reconstruct aligned strings from CIGAR
+    t_aln, r_aln, match = [], [], []
+    ti, ri = 0, s
+    for ch in re.findall(r'\d+[=XIDS]', cigar):
+        n, op = int(ch[:-1]), ch[-1]
+        if op in ('=', 'X'):
+            t_aln.append(fwd_template[ti:ti+n])
+            r_aln.append(read_seq[ri:ri+n])
+            match.append('|' * n if op == '=' else ''.join('.' for _ in range(n)))
+            ti += n; ri += n
+        elif op == 'I':  # insertion in read
+            t_aln.append('-' * n)
+            r_aln.append(read_seq[ri:ri+n])
+            match.append(' ' * n)
+            ri += n
+        elif op == 'D':  # deletion in read
+            t_aln.append(fwd_template[ti:ti+n])
+            r_aln.append('-' * n)
+            match.append(' ' * n)
+            ti += n
+    print(f"  template : {''.join(t_aln)}")
+    print(f"             {''.join(match)}")
+    print(f"  read     : {''.join(r_aln)}")
+    print(f"  extracted: {candidate}  (edit dist={res['editDistance']})")
 
 
 def extract_barcode_sequence(
@@ -149,64 +193,70 @@ def extract_barcode_sequence(
         read_states.append(("r", mappy.revcomp(read_seq)))
 
     for orient, current_seq in read_states:
-        windows_to_check = []
+        best_edit_dist = float("inf")
+        best_candidates = []
 
+        windows_to_check = []
         if search_first_n_bases is not None:
             windows_to_check.append(current_seq[:search_first_n_bases])
         if search_last_n_bases is not None:
             windows_to_check.append(current_seq[-search_last_n_bases:])
-
         if not windows_to_check:
             windows_to_check.append(current_seq)
 
-        for w_idx, window_seq in enumerate(windows_to_check):
-
-            # THE SCAFFOLD SEARCH
+        for window_seq in windows_to_check:
             res = edlib.align(fwd_template, window_seq, "HW", "locations", max_errs, additionalEqualities=dna_eq)
-
             if res["editDistance"] == -1:
                 continue
 
             s, e = res["locations"][0]
-            footprint = window_seq[max(0, s - 3): min(len(window_seq), e + 4)]
+            extracted = None
 
             if mode == "dual":
-                f5_errs = int(len(f5_fwd) * max_error_rate)
-                f3_errs = int(len(f3_fwd) * max_error_rate)
-                res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=f5_errs)
-                res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=f3_errs)
-
-                if res_5["editDistance"] != -1 and res_3["editDistance"] != -1:
-                    e5, s3 = res_5["locations"][0][1], res_3["locations"][-1][0]
-                    if s3 > e5:
-                        extracted = footprint[e5 + 1: s3]
-                        if abs(len(extracted) - expected_bc_len) <= length_tolerance:
-                            candidates.append(extracted)
+                # Barcode position is directly implied by the scaffold match coordinates
+                candidate = window_seq[s + len(f5_fwd) : e + 1 - len(f3_fwd)]
+                if abs(len(candidate) - expected_bc_len) <= length_tolerance:
+                    extracted = candidate
 
             elif mode == "f5_only":
-                f5_errs = int(len(f5_fwd) * max_error_rate)
-                res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=f5_errs)
-
+                footprint = window_seq[max(0, s - 3): min(len(window_seq), e + 4)]
+                res_5 = edlib.align(f5_fwd, footprint, "HW", "locations", k=int(len(f5_fwd) * max_error_rate))
                 if res_5["editDistance"] != -1:
                     e5 = res_5["locations"][0][1]
-                    extracted = footprint[e5 + 1: e5 + 1 + expected_bc_len]
-
-                    if len(extracted) == expected_bc_len:
-                        candidates.append(extracted)
+                    candidate = footprint[e5 + 1: e5 + 1 + expected_bc_len]
+                    if len(candidate) == expected_bc_len:
+                        extracted = candidate
 
             elif mode == "f3_only":
-                f3_errs = int(len(f3_fwd) * max_error_rate)
-                res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=f3_errs)
-
+                footprint = window_seq[max(0, s - 3): min(len(window_seq), e + 4)]
+                res_3 = edlib.align(f3_fwd, footprint, "HW", "locations", k=int(len(f3_fwd) * max_error_rate))
                 if res_3["editDistance"] != -1:
                     s3 = res_3["locations"][-1][0]
-                    extracted = footprint[max(0, s3 - expected_bc_len): s3]
+                    candidate = footprint[max(0, s3 - expected_bc_len): s3]
+                    if len(candidate) == expected_bc_len:
+                        extracted = candidate
 
-                    if len(extracted) == expected_bc_len:
-                        candidates.append(extracted)
+            if extracted is not None:
+                if res["editDistance"] < best_edit_dist:
+                    best_edit_dist = res["editDistance"]
+                    best_candidates = [extracted]
+                elif res["editDistance"] == best_edit_dist and extracted not in best_candidates:
+                    best_candidates.append(extracted)
 
+        candidates.extend(best_candidates)
+
+    if VERBOSE:
+        print(f"candidates: {candidates}")
+        for candidate in candidates:
+            idx = read_seq.find(candidate)
+            if idx != -1:
+                context_start = max(0, idx - len(f5_fwd or ""))
+                context_end   = min(len(read_seq), idx + len(candidate) + len(f3_fwd or ""))
+                context = read_seq[context_start:context_end]
+                padding = " " * (idx - context_start)
+                print(f"  context : {context}")
+                print(f"  found   : {padding}{candidate}")
     return candidates
-
 
 # =============================================================================
 # BAM Handling
@@ -226,6 +276,9 @@ def process_and_write_read(bam_writer, ref_id, name, seq1, qual1, barcode, align
     alns1 = [a for a in aligner.map(seq1) if a.mapq >= min_mapq]
     if not alns1:
         return MappingResult.MAPPING_FAILED
+
+    if VERBOSE:
+        print(alns1)
 
     q_arr1 = pysam.qualitystring_to_array(qual1) if qual1 else None
 
@@ -546,7 +599,7 @@ def run_pipeline(
         output_bam_path: str,
         f5_fwd: Optional[str] = None,
         f3_fwd: Optional[str] = None,
-        barcode_max_edits: int = 0,
+        max_bc_edit_distance: int = 0,
         barcode_start_pos: Optional[int] = None,
         barcode_end_pos: Optional[int] = None,
         minimap2_preset: str = "splice",
@@ -580,7 +633,8 @@ def run_pipeline(
     matcher = BarcodeMatcher(
         sorted(plasmid_library.keys()),
         check_reverse_complement=check_reverse_complement,
-        fuzzy_mode=fuzzy_mode
+        fuzzy_mode=fuzzy_mode,
+
     )
     stats = PipelineStats()
 
@@ -590,6 +644,9 @@ def run_pipeline(
     try:
         logger.info("Processing reads...")
         with pysam.AlignmentFile(temp_bam_path, "wb", header=header) as unsorted_bam:
+
+            if VERBOSE:
+                print("\n\nNew read")
 
             read_iter = mappy.fastx_read(fastq_path)
             read2_iter = mappy.fastx_read(fastq2_path) if fastq2_path else None
@@ -643,7 +700,9 @@ def run_pipeline(
 
                 # Test every candidate extracted from the read
                 for raw_extracted in raw_extracted_list:
-                    bc, res = matcher.match(raw_extracted, max_edits=barcode_max_edits)
+                    bc, res = matcher.match(raw_extracted, max_edits=max_bc_edit_distance)
+                    if VERBOSE:
+                        print(res)
                     if bc is not None:
                         matched_barcode = bc
                         match_result = res
@@ -720,10 +779,10 @@ def main():
                            help="Specific 5' flanking sequence (must be identical for all references).")
     loc_group.add_argument("--three_prime_flank",
                            help="Specific 3' flanking sequence (must be identical for all references).")
-    loc_group.add_argument("--five_prime_flank_length", type=int, default=8,
-                           help="Length of 5' flank to infer from wildcards (default: 8).")
-    loc_group.add_argument("--three_prime_flank_length", type=int, default=8,
-                           help="Length of 3' flank to infer from wildcards (default: 8).")
+    loc_group.add_argument("--five_prime_flank_length", type=int, default=12,
+                           help="Length of 5' flank to infer from wildcards (default: 12).")
+    loc_group.add_argument("--three_prime_flank_length", type=int, default=12,
+                           help="Length of 3' flank to infer from wildcards (default: 12).")
     loc_group.add_argument("--barcode_start_pos", type=int,
                            help="0-based start index of the barcode (for deterministic reads like Illumina).")
     loc_group.add_argument("--barcode_end_pos", type=int,
@@ -741,7 +800,7 @@ def main():
     align_group = parser.add_argument_group("Alignment & Matching Settings")
     align_group.add_argument("--check_reverse_complement", choices=["True", "False"], default="True",
                              help="Check the reverse complement of the barcode (default: True). Must be False for positional extraction.")
-    align_group.add_argument("--minimum_distance", type=int, default=0,
+    align_group.add_argument("--max_bc_edit_distance", type=int, default=0,
                              help="Max edit distance for fuzzy barcode matching (default: 0).")
     align_group.add_argument("--minimap2_preset", default="splice",
                              help="Minimap2 preset (default: 'splice').", choices=["lr", "map-ont", "ava-ont", "map-pb", "ava-pb",
@@ -823,6 +882,10 @@ def main():
             rname_equals_barcode=args.rname_equals_barcode  # <--- Added here
         )
 
+        if VERBOSE:
+            print(f5)
+            print(f3)
+
         # 3. Run Pipeline (You will need to pass the new args down)
         print(f"Starting pipeline. Outputting to {args.output}...")
         stats = run_pipeline(
@@ -831,7 +894,7 @@ def main():
             output_bam_path=args.output,
             f5_fwd=f5,
             f3_fwd=f3,
-            barcode_max_edits=args.minimum_distance,
+            max_bc_edit_distance=args.max_bc_edit_distance,
             barcode_start_pos=args.barcode_start_pos,
             barcode_end_pos=args.barcode_end_pos,
             minimap2_preset=args.minimap2_preset,
